@@ -4,33 +4,49 @@ title: "Troubleshooting Puppetized DSC Modules"
 author: michaeltlombardi
 ---
 
-Occasionally, something will go wrong when trying to apply a manifest containing Puppetized DSC resources.
-There's a few different ways this can happen:
+# Troubleshooting Puppetized DSC Modules
 
-- There can be a misgenerated type, in which case the Puppet representation of the DSC resource does not match the resource's API surface.
-  This can be mismatched enums or types—in these cases, the issue is with this builder and a bug will need to be submitted for this project so the Puppetized module can be rebuilt with the patched builder.
-- There can be an error in the Ruby code that translates the DSC resource back and forth between Puppet and PowerShell, in which case the issue is with the base provider that lives in the pwshlib module; Once a bug is submitted for that project and a fix is released, the manifest and Puppetized module should work without any updates except in the dependency pwshlib module.
-- There can be an error in the underlying DSC resource's implementation in PowerShell—in this case, you'll need to submit a bug with the upstream maintainers for that DSC resource's PowerShell module.
-  Once a new release of that module is out a new build of the Puppetized module can happen, vendoring in those updates.
+Authoring Puppet manifests using the new [Puppetized DSC Resources](https://url/here) is a [few steps and a deploy](https://link-to-how-to) away for most use cases. Sometimes you will run into a problem trying to apply a manifest containing one or more Puppetized DSC resources. What could be causing the problem?
 
-This blog post dives into a little more detail on how to specifically debug and troubleshoot Puppetized DSC Modules to discover which of these error categories you're experiencing and help you file detailed and useful bug reports that should see these bugs resolved more quickly.
+Is it a problem with the builder? The Puppet representaion of the DSC Resource could not match the API surface, resulting in misgernerated types, enums or method calls.
 
-## Basics
+Could the problem be the DSC Resource itself? The PowerShell DSC code could not work, which would be hidden underneath the Puppet Ruby exception stacktrace.
 
-The first thing to note is that there's actually a [basic troubleshooting guide for `Puppet.Dsc`][troubleshooting-doc].
-That guide already covers finding [type errors][type-errors], [incorrect enums][incorrect-enums], and [invocation errors][invocation-errors] during a Puppet run, so we won't cover those again here.
+What happens if it's Puppet? There could be an error in the Ruby code that translates the DSC resource back and forth between Puppet and PowerShell, in which case the issue lies in the pwshlib module.
 
-It also covers running Puppet in **debug** mode, which we need to talk about for the next couple sections on how to validate the conversion of your Puppet manifest to the hash being passed to `Invoke-DscResource` and how you can test that invocation outside of a Puppet run.
+Somewhere in between? How do you tell which symptom is which problem? Where do you begin to troubleshoot this? Never fear, there is a way forward.
 
-In short, if you append the `--debug` flag to the end of your Puppet invocation, you'll get a _ton_ of additional information out of the run.
+## Basic Troubleshooting
 
-### Validating manifests and the PowerShell hash
+The first thing to note is that there is a basic [troubleshooting guide for Puppet.Dsc][troubleshooting-doc]. This guide covers finding problems like [type errors][type-errors] or [incorrect enums][incorrect-enums] in the module builder, [invocation errors][invocation-errors] during a Puppet run, or problems with the translation layer in `pwshlib`. There is a lot of good information there so we won't cover those areas here.
 
-When you specify a DSC Resource in your Puppet manifest, behind the scenes Puppet converts that into a PowerShell hash to pass to `Invoke-DscResource`.
-In debug mode, you can actually see what Puppet thinks you passed _and_ that hash:
+The guide also covers running Puppet in **debug** mode, which you will need to know about for the next couple sections. In short, if you append the `--debug` flag to the end of your Puppet invocation, you'll get a _ton_ of additional information out of the run. Feel free to read the guide to make sure you have a reference point before we proceed here.
+
+## Advanced Troubleshooting
+
+So, you have a Puppet manifest with one or more Puppetized DSC Resource declarations in it. Things are not working and the basic troublshooting guide didn't solve the problem.
+
+The first place to start is to validate that what you declared in the manifest was translated correctly to the PowerShell DSC code to execute.
+
+### Validating Puppet manifests and the generated PowerShell DSC code
+
+When you specify a Puppetized DSC Resource in your Puppet manifest, behind the scenes Puppet converts that into PowerShell code to pass to the DSC `Invoke-DscResource` cmdlet.
+
+In [debug mode](https://link-to-debug), you can actually see what Puppet thinks you passed _and_ that generated code.
+
+Lets walk through an example manifest:
+
+
+```puppet
+dsc_psrepository { 'PowerShell Gallery':
+  dsc_name               => 'psgAllery',
+  dsc_installationpolicy => 'Trusted',
+}
+```
+
+If we execute Puppet in debug mode, we'll get the following (abrevviated) output:
 
 ```
-... (snipped for brevity)
 Debug: dsc_psrepository[{:name=>"PowerShell Gallery", :dsc_name=>"psgAllery"}]: Updating: Invoking Set Method for '{:name=>"PowerShell Gallery", :dsc_name=>"psgAllery"}' with {:name=>"PowerShell Gallery", :dsc_name=>"psgAllery", :dsc_installationpolicy=>"Trusted"}
 ... (snipped for brevity)
 dsc_psrepository[{:name=>"PowerShell Gallery", :dsc_name=>"psgAllery"}]: Updating: Script:
@@ -41,19 +57,17 @@ $InvokeParams = @{Name = 'PSRepository'; Method = 'set'; Property = @{name = 'ps
   $Response.errormessage   = $_.Exception.Message
   return ($Response | ConvertTo-Json -Compress)
 }
-... (snipped for brevity)
 ```
 
-That's an example result for the following Puppet manifest:
+Breaking this apart, there are several sections of information to pull out.
 
-```puppet
-dsc_psrepository { 'PowerShell Gallery':
-  dsc_name               => 'psgAllery',
-  dsc_installationpolicy => 'Trusted',
-}
+The first line is Puppet telling us why it's doing what it's doing and with what information it has to execute. We see its the PowerShell Gallery module, using the Gallery DSC Resource and setting the installationpolicu to trusted.
+
+```
+Debug: dsc_psrepository[{:name=>"PowerShell Gallery", :dsc_name=>"psgAllery"}]: Updating: Invoking Set Method for '{:name=>"PowerShell Gallery", :dsc_name=>"psgAllery"}' with {:name=>"PowerShell Gallery", :dsc_name=>"psgAllery", :dsc_installationpolicy=>"Trusted"}
 ```
 
-We can see that Puppet interpreted this as the following Ruby hash:
+This can be more easily read as as Ruby hash:
 
 ```ruby
 {
@@ -63,7 +77,13 @@ We can see that Puppet interpreted this as the following Ruby hash:
 }
 ```
 
-If we grab the `$InvokeParams` line, we can see what Puppet is passing to `Invoke-DscResource` (expanded from one line for clarity; note your `ModuleName` path will be system-specific):
+The next part in the log to look at is the invocation parameters. This is the PowerShell code generated from the section we just examined:
+
+```
+$InvokeParams = @{Name = 'PSRepository'; Method = 'set'; Property = @{name = 'psgAllery'; installationpolicy = 'Trusted'}; ModuleName = @{ModuleName = 'C:/pathToPuppetModules/powershellget/lib/puppet_x/powershellget/dsc_resources/PowerShellGet/PowerShellGet.psd1'; RequiredVersion = '2.2.4.1'}}
+```
+
+Translating that to a PowerShell hash, we can see a similar represation of the Ruby hash we just looked at. This is the exact code that will be passed to `Invoke-DscResource` (expanded from one line for clarity; note your `ModuleName` path will be system-specific):
 
 ```powershell
 $InvokeParams = @{
@@ -77,27 +97,38 @@ $InvokeParams = @{
 }
 ```
 
-This leads us neatly to trying to invoke the DSC Resource outside of Puppet.
+In summary, the debug logs from a Puppet execution run provide us detailed information about how your Puppet manifest was translated into DSC code.
 
-### Invoking without Puppet
+This leads us neatly into trying to use this information to invoke the DSC Resource outside of Puppet to debug the DSC Resource.
 
-In a PowerShell console with administrator permissions, you'll want to copy and paste in the `$InvokeParams` line from the debug log.
-Next, you'll want to run the following command:
+### Invoking DSC Resources without Puppet
+
+After inspecting the debug Puppet logs, we now have the PowerShell code Puppet was executing to try out. We can take that code and move to a test machine and walk through the execution ourselves interactively.
+
+In a PowerShell console with administrator permissions, you'll copy and paste the `$InvokeParams` line from the debug log we pulled out above. Then you'll invoke it using `Invoke-DscRsource`. For example:
 
 ```powershell
-Invoke-DscResource @InvokeParams -Verbose
+PS C:\> $InvokeParams = @{
+>>   Name = 'PSRepository';
+>>   Method = 'get';
+>>   Property = @{ name = 'psgAllery' };
+>>   ModuleName = @{
+>>     ModuleName = 'C:/pathToPuppetModules/powershellget/lib/puppet_x/powershellget/dsc_resources/PowerShellGet/PowerShellGet.psd1';
+>>     RequiredVersion = '2.2.4.1'
+>>   }
+>> }
+PS C:\> Invoke-DscResource @InvokeParams -Verbose
 ```
 
-Now you can evaluate the success/failure of the invocation without involving Puppet at all;
-this way you can determine if the values being passed were incorrect, or if the DSC Resource itself is misbehaving.
+Now you can evaluate the success/failure of the invocation without involving Puppet at all. This way you can determine if the values being passed were incorrect or if the DSC Resource itself is misbehaving.
 
-If something _has_ gone wrong converting the values in your Puppet manifest to the `InvokeParams` hash being passed to `Invoke-DscResource`, please do [file an issue][puppet-dsc-bug-report] with us and we'll be sure to take a look.
+If the code fails after pasting in the `$InvokeParams` block, then there is something wrong with the values or the hash statement. If something _has_ gone wrong converting the values in your Puppet manifest to the `InvokeParams` hash being passed to `Invoke-DscResource`, please do [file an issue][puppet-dsc-bug-report] with us and we'll be sure to take a look.
 
-If it's an issue with the DSC Resource, hopefully you'll have enough information to put together a bug report for the upstream PowerShell module and file that.
+If the code fails after invoking `Invoke-DscResource`, then there is likely a problem inside the DSC Resource itself. If it's an issue with the DSC Resource, hopefully you'll have enough information from the execution to put together a bug report for the upstream PowerShell module and work with that DSC Resouce's authors for a resolution.
 
-#### Credentials
+#### Invoking DSC Resources with PSCredentials
 
-When your manifest specifies a credential or a nested CIM instance, you'll see one or more lines above the `InvokeParams` declaration, like this (expanded for readability):
+When your manifest specifies a PSCredential or a nested CIM Instance, you'll see one or more lines above the `$InvokeParams` declaration, like this (expanded for readability):
 
 ```powershell
 $febabd4f_19e8_4ed6_a218_188e275ecc05 = New-PSCredential -User apple -Password '#<Sensitive [value redacted]>'
@@ -116,8 +147,7 @@ $InvokeParams = @{
 }
 ```
 
-Note that it is building a credential object from plain text before passing that object to DSC;
-the debug logs will strip the password from being returned.
+Note that it is building a credential object from plain text before passing that object to DSC. The debug logs will strip the password from being shown in the text.
 
 In this case, you will need some of the custom helper code that we snipped for brevity earlier, namely this function:
 
@@ -143,15 +173,20 @@ function new-pscredential {
 ```
 
 Make sure to copy that code into your terminal _before_ you try to copy in the invocation variables and _also_ remember to replace `#<Sensitive [value redacted]>` with the appropriate password string.
+
 Alternatively, you could use `Get-Credential` and capture the output of that command to the same variable name from your debug log.
 
-### CIM Instances
+After handling the PSCredential, troublshooting follows the same procedure as [Invoking DSC Resources with PSCredentials](#invoking-dsc-resources-with-pscredentials)
 
-Some DSC Resources use nested CIM instances to pass hashes as property values in these cases, there's one or more lines above the definition of the `InvokeParams` variable which creates these CIM instances;
-this is necessary for DSC to correctly handle the objects, _especially_ if they have a CIM instance class specific to the DSC Resource being called.
+### Invoking DSC Resources with CIM Instances
+
+Some DSC Resources use nested CIM Instances to pass hashes as property values. In these cases, there's one or more lines above the definition of the `$InvokeParams` variable which creates these CIM instances.
 
 ```powershell
-$b615d113_bb6e_49e4_9776_7e895dfe20c7 = New-CimInstance -ClientOnly -ClassName 'MSFT_KeyValuePair' -Property @{'key' = 'Accept-Language' ; 'value' = 'en-US'}
+$b615d113_bb6e_49e4_9776_7e895dfe20c7 = New-CimInstance -ClientOnly -ClassName 'MSFT_KeyValuePair' -Property @{
+  'key' = 'Accept-Language';
+  'value' = 'en-US'
+}
 $InvokeParams = @{
   Name = 'xRemoteFile';
   Method = 'set';
@@ -167,19 +202,25 @@ $InvokeParams = @{
 }
 ```
 
+This is necessary for DSC to correctly handle the objects, _especially_ if they have a custom CIM instance class specific to the DSC Resource being called.
+
+After handling the CIM Instance, troublshooting follows the same procedure as [Invoking DSC Resources with PSCredentials](#invoking-dsc-resources-with-pscredentials)
+
 ## Digging deeper
 
-Sometimes, reading the debug logs doesn't give you enough control over what's going on.
-When this is the case, the most powerful thing you can do is learn to interactively debug a Puppet run.
+Sometimes, reading the debug logs doesn't give you enough information about what's going on. You may need to _pry_ into the parts of Puppet that happen after the execution starts, but before the PowerShell code is executed.
+
+When this is the case, the most powerful thing you can do is learn to interactively debug a Puppet run using a tool called [pry][pry].
 
 ### Getting started with Pry
 
-[Pry][pry] is a powerful tool for interactively debugging ruby.
-Using it with Puppet on Windows is a bit involved but it can be an extremely useful tool in your kit.
+[Pry][pry] is a powerful tool for interactively debugging ruby. Using it with Puppet on Windows is a bit involved but it can be an extremely useful tool in your kit.
 
-First, you'll want to get a functional ruby environment installed _separate_ from the PDK - right now, the PDK does not support prying into a Puppet run due to limitations around native gems.
+First, you'll want to get a functional ruby environment installed _separate_ from the PDK.
 
-We suggest you do this via [Glenn Sarti's `RubyInstaller`][rubyinstaller] PowerShell module:
+> Right now, the PDK does not support prying into a Puppet run due to limitations around native gems. If you don't know what this means right now, don't worry too much. As you get more used to how Ruby and Puppet works it will make more sense.
+
+You can accomplish this however you want, but make sure there is an installation of both Ruby and the associated Debugkit installed when you are done. We suggest you do this via [Glenn Sarti's `RubyInstaller`][rubyinstaller] PowerShell module:
 
 ```powershell
 Install-Module RubyInstaller -Scope CurrentUser
@@ -189,21 +230,23 @@ Install-Module RubyInstaller -Scope CurrentUser
 Install-Ruby
 ```
 
-The next step is to find the module files on disk.
-They're _probably_ in a location like this one:
+The next step is to find the module files on disk. They're _probably_ in a location like this one:
 
 ```
 C:/ProgramData/PuppetLabs/code/environments/<your environment name>/modules/
 ```
 
-You're going to want to `Set-Location` to the module you want to debug, like:
+The actual location will depend on how you configured your Puppet Environments.
+
+Next you're going to `Set-Location` to the module you want to debug, like so:
 
 ```powershell
 Set-Location 'C:/ProgramData/PuppetLabs/code/environments/production/modules/powershellget'
 ```
 
-We strongly suggest opening this location in VSCode to make editing a bit easier on yourself.
-In any case, you will want to _delete_ the file `Gemfile.lock` in this directory and create a new file, `Gemfile.local`, with the following content:
+> We strongly suggest opening this location in VSCode to make editing a bit easier on yourself.
+
+In any case, you will want to _delete_ the file `Gemfile.lock` in this directory and create a new file, `Gemfile.local` with the following content:
 
 ```ruby
 gem 'fuubar'
@@ -211,34 +254,28 @@ gem 'pry-byebug'
 gem 'pry-stack_explorer'
 ```
 
-Next, you're going to need to run the following commands:
+Next, you will to run the following commands:
 
 ```powershell
 # This loads ruby 2.5 for use; if you don't do this, you won't be able to run other commands
 uru 2.5
-```
 
-```powershell
 # This is only necessary after you first install a ruby version; it's a tool to manage ruby dependencies
 gem install bundler
-```
 
-```powershell
 # This will cause bundler install all of the ruby dependencies into the folder you're currently in
 bundle config set path '.bundle/gems'
-```
 
-```powershell
 # This will install all of your ruby dependencies
 bundle install
-```
 
-```powershell
 # This will pull down a copy of the `pwslib` module for use and editing in the rest of your debugging
 bundle exec rake spec_prep
 ```
 
-Create a new file in the module folder at `./examples/test.pp` and put your test manifest code in there.
+At this point, you have a functioning Ruby installation and a Puppet Module setup and ready to be debugged.
+
+The next step is to create a new file in the module folder at `examples/test.pp` and put your test manifest code in there.
 
 Now, you can run your test manifest with the following command:
 
@@ -246,9 +283,9 @@ Now, you can run your test manifest with the following command:
 bundle exec puppet apply ./examples/test.pp --modulepath ./spec/fixtures/modules
 ```
 
-If you want to run in debug mode, append `--debug` to the end of that command.
+If you want to run in debug mode, append `--debug` to the end of that command. The output you saw during a normal Puppet run show show, and the command runs until it stops at the error you are currently investigating.
 
-Now, you're ready to start adding pry statements to the base provider and digging around.
+Now you're ready to start adding _pry_ statements to the base provider and digging around.
 
 ### Prying into the base provider
 
